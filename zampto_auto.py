@@ -98,20 +98,45 @@ def load_session(path=SESSION_FILE):
 
 
 def sync_cookies_to_session(session_obj, cookies):
-    """Sync a list of cookie dicts into a requests.Session."""
+    """Sync a list of cookie dicts into a requests.Session.
+
+    FIX: __Host- prefixed cookies (Laravel) require secure=True, path="/",
+    and NO domain attribute. Python's cookielib rejects them if domain is
+    non-empty, so we pass domain="" for __Host-/__Secure- cookies.
+    """
     session_obj.cookies.clear()
     for c in cookies:
+        name = c["name"]
+        value = c["value"]
         try:
-            session_obj.cookies.set(
-                c["name"],
-                c["value"],
-                domain=c.get("domain", ""),
-                path=c.get("path", "/"),
-                secure=c.get("secure", False),
-                expires=c.get("expires"),
-            )
+            if name.startswith("__Host-"):
+                # __Host- 前缀: 必须 secure=True, path="/", 不能有 domain
+                session_obj.cookies.set(
+                    name, value,
+                    path="/",
+                    domain="",
+                    secure=True,
+                    expires=c.get("expires"),
+                )
+            elif name.startswith("__Secure-"):
+                session_obj.cookies.set(
+                    name, value,
+                    domain=c.get("domain", ""),
+                    path="/",
+                    secure=True,
+                    expires=c.get("expires"),
+                )
+            else:
+                session_obj.cookies.set(
+                    name, value,
+                    domain=c.get("domain", ""),
+                    path=c.get("path", "/"),
+                    secure=c.get("secure", False),
+                    expires=c.get("expires"),
+                )
         except Exception as e:
-            log.warning("Cookie set failed (%s): %s", c.get("name"), e)
+            log.warning("Cookie set failed (%s): %s", name, e)
+    log.info("Synced %d cookies to session", len(cookies))
 
 
 def find_csrf_cookie(cookies):
@@ -124,54 +149,68 @@ def find_csrf_cookie(cookies):
 
 
 def refresh_csrf_token(api_session, base_url=DASHBOARD_URL, server_id=None):
-    """Get the latest CSRF token from server response.
+    """Get a fresh CSRF token from server response.
 
-    Per the Zampto dashboard JS (getCsrfCookie / getCsrfToken in HTML):
-      - Token = full zampto_csrf cookie value
-      - Sent via X-CSRF-Token header on every non-GET request
-      - Server issues a NEW cookie on every response (old value expires immediately)
-
-    IMPORTANT: We read Set-Cookie header DIRECTLY from response.raw.headers.getlist,
-    because requests.Session's cookie jar sometimes keeps stale value if domain/path
-    don't exactly match. Multiple Set-Cookie headers may be merged into one dict entry.
+    Zampto 已不再在 Set-Cookie header 中返回 zampto_csrf。
+    本函数依次尝试:
+      1. Set-Cookie header (旧方法)
+      2. HTML body 解析 (<meta> / JS 变量)
+      3. session.cookies (旧 token, 可能已过期)
     """
+    def extract_csrf(text):
+        """从 HTML 中提取 CSRF token"""
+        # <meta name="csrf-token" content="...">
+        m = re.search(r'<meta\s+[^>]*name=[\'"]csrf-token[\'"]\s+content=[\'"]([^\'"]+)[\'"]', text, re.I)
+        if m:
+            return m.group(1)
+        # var csrfToken = '...' 或 window.csrf = '...'
+        m = re.search(r"(?:csrf|crsf|_token)\s*[:=]\s*[\"']([A-Za-z0-9_\-\.]{40,300})", text, re.I)
+        if m:
+            return m.group(1)
+        return None
+
     try:
-        # Trigger a fresh Set-Cookie by hitting any endpoint
-        r = api_session.get(f"{base_url}/api/servers", timeout=10)
-        log.info("  Triggered CSRF refresh via /api/servers (status=%d)", r.status_code)
+        for url in [f"{base_url}/", f"{base_url}/dashboard", f"{base_url}/api/servers"]:
+            r = api_session.get(url, timeout=10)
+            log.info("  CSRF refresh via %s (status=%d)", url, r.status_code)
+            ct = (r.headers.get("content-type") or "").lower()
 
-        # Read Set-Cookie headers DIRECTLY from raw response (most reliable)
-        try:
-            set_cookies = r.raw.headers.getlist("Set-Cookie")
-        except (AttributeError, KeyError):
+            # Method 1: from Set-Cookie header
             set_cookies = []
-            # Fallback to single header
-            if "Set-Cookie" in r.headers:
-                set_cookies.append(r.headers["Set-Cookie"])
+            try:
+                set_cookies = r.raw.headers.getlist("Set-Cookie")
+            except (AttributeError, KeyError):
+                if "Set-Cookie" in r.headers:
+                    set_cookies.append(r.headers["Set-Cookie"])
+            for sc in set_cookies:
+                lower_sc = sc.lower()
+                if "zampto_csrf=" in lower_sc:
+                    start = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
+                    rest = sc[start:]
+                    end = rest.find(";")
+                    token = rest[:end] if end != -1 else rest
+                    token = token.strip()
+                    if token:
+                        log.info("  ✓ CSRF from Set-Cookie (len=%d)", len(token))
+                        api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
+                        return token
 
-        for sc in set_cookies:
-            lower_sc = sc.lower()
-            if "zampto_csrf=" in lower_sc:
-                # Extract value between "zampto_csrf=" and first ";"
-                idx = lower_sc.index("zampto_csrf=") + len("zampto_csrf=")
-                rest = sc[idx:]
-                end = rest.find(";")
-                token = rest if end == -1 else rest[:end]
-                token = token.strip()
+            # Method 2: from HTML document
+            if "html" in ct:
+                token = extract_csrf(r.text)
                 if token:
-                    log.info("  ✓ Fresh CSRF from Set-Cookie header (length=%d)", len(token))
-                    # Also update session.cookies so subsequent requests send the right cookie
+                    log.info("  ✓ CSRF from HTML body (len=%d)", len(token))
                     api_session.cookies.set("zampto_csrf", token, domain=".zampto.net", path="/")
                     return token
 
-        # Fallback: read from session.cookies
-        log.warning("  No Set-Cookie with zampto_csrf in response, using session.cookies")
+        # Fallback: stale token from session.cookies
+        log.warning("  No fresh CSRF from Set-Cookie or HTML, using session.cookies")
         for c in api_session.cookies:
             if "csrf" in c.name.lower():
-                log.info("  ✓ CSRF from session.cookies (length=%d)", len(c.value))
+                log.info("  Using stale CSRF from cookies (len=%d)", len(c.value))
                 return c.value
 
-        log.warning("  No CSRF cookie found anywhere")
+        log.warning("  No CSRF found anywhere")
         return None
     except Exception as e:
         log.warning("  CSRF refresh failed: %s", e)
@@ -276,14 +315,162 @@ def phase_browser_login_interactive():
     log.info("Interactive login completed. Session saved to session.json.")
 
 
-def phase_api_renewal(use_cookies=None):
-    """Phase 2: Use provided cookies to renew server via pure API (no browser)."""
-    log.info("=== PURE API RENEWAL MODE ===")
+# ========================
+# Phase 2: 浏览器自动续期
+# ========================
+def renew_via_browser_fetch(page, sid):
+    """在浏览器页面上下文中尝试刷新服务器。
+    CSRF token 由浏览器自动管理，无需手动刷新。"""
+    import json as _json
+    bodies = [
+        {"server_id": sid}, {"id": sid}, {"serverId": sid},
+        {"server": sid}, {"sid": sid},
+    ]
+    for body in bodies:
+        try:
+            js = f"""
+(async () => {{
+    try {{
+        const res = await fetch('/api/server/renew', {{
+            method: 'POST',
+            headers: {{'Content-Type': 'application/json'}},
+            body: '{_json.dumps(body)}',
+        }});
+        const text = await res.text();
+        return JSON.stringify({{status: res.status, body: text}});
+    }} catch(e) {{ return JSON.stringify({{status: 0, body: e.message}}); }}
+}})();
+"""
+            result = page.evaluate(js)
+            data = _json.loads(result)
+            log.info("  fetch /api/server/renew body=%s -> HTTP %s", body, data.get("status"))
+            if data.get("status") in (200, 201, 204, 202):
+                return True, data
+        except Exception as e:
+            log.warning("  fetch attempt failed: %s", e)
+    return False, None
 
-    # Use provided cookies or fall back to loading from file
-    cookies = use_cookies
+
+def phase_browser_renewal(cookies=None):
+    """Phase 2: 浏览器自动续期。
+    返回: "renewed" / "skipped" / "failed" """
+    log.info("=== BROWSER RENEWAL MODE ===")
+    if not HAS_CLOAKBROWSER:
+        log.error("CloakBrowser not available")
+        return "failed"
+
     if not cookies:
         cookies = load_session()
+    if not cookies:
+        log.error("No cookies available")
+        return "failed"
+
+    # 预检查剩余时间
+    try:
+        api = get_api_session()
+        sync_cookies_to_session(api, cookies)
+        r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+        if r.status_code == 200:
+            for sv in (r.json().get("servers") or []):
+                if str(sv.get("id")) == str(SERVER_ID):
+                    exp_raw = sv.get("renewal", "")
+                    if exp_raw:
+                        from datetime import datetime as dt_cls, timedelta
+                        dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                        expires_at = dt_ob + timedelta(hours=48)
+                        rem_h = (expires_at - datetime.now(timezone.utc)).total_seconds() / 3600
+                        if rem_h > 42:
+                            log.info("剩余 %.0fh (>42h), 跳过续期", rem_h)
+                            return "skipped"
+    except:
+        pass
+
+    log.info("Launching CloakBrowser headless...")
+    proxy = None
+    if os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY"):
+        proxy = {"server": "socks5://127.0.0.1:1080"}
+
+    try:
+        browser = launch(headless=True, proxy=proxy)
+        ctx = browser.new_context(no_viewport=True)
+        page = ctx.new_page()
+
+        # 注入 cookies
+        for c in cookies:
+            try:
+                cookie = {
+                    "name": c["name"],
+                    "value": c["value"],
+                    "path": c.get("path", "/"),
+                    "secure": c.get("secure", True),
+                }
+                if c["name"].startswith("__Host-"):
+                    # __Host- 不能含 domain
+                    cookie["domain"] = ".zampto.net"
+                else:
+                    cookie["domain"] = c.get("domain", ".zampto.net")
+                ctx.add_cookies([cookie])
+            except Exception as e:
+                log.warning("  skip cookie %s: %s", c["name"], e)
+
+        # 访问面板主页
+        log.info("导航到 %s ...", DASHBOARD_URL)
+        page.goto(DASHBOARD_URL, wait_until="load", timeout=30000)
+        page.wait_for_timeout(3000)
+        snap(page, "02_dashboard.png")
+
+        if "/auth/login" in page.url:
+            log.error("需要重新登录 - Cookie 已过期")
+            browser.close()
+            return False
+
+        log.info("面板加载完成, URL: %s", page.url)
+
+        # 转到服务器详情页（续期按钮在这里）
+        server_url = f"{DASHBOARD_URL}/server?id={SERVER_ID}"
+        log.info("导航到服务器页: %s", server_url)
+        page.goto(server_url, wait_until="load", timeout=30000)
+        page.wait_for_timeout(3000)
+        snap(page, "03_server_page.png")
+        log.info("服务器页加载完成, URL: %s", page.url)
+
+        # 执行续期
+        sid = SERVER_ID
+        renewed, data = renew_via_browser_fetch(page, sid)
+        if renewed:
+            log.info("续期成功! response: %s", data.get("body", "")[:200])
+            browser.close()
+            return "renewed"
+
+        # 如果 fetch 失败, 尝试从页面找续期按钮
+        log.info("fetch 失败, 尝试在页面中寻找 Renew 按钮...")
+        try:
+            renew_btn = page.query_selector('button:has-text("Renew"), a:has-text("Renew"), [data-action="renew"], #renew-btn')
+            if renew_btn:
+                log.info("找到了 Renew 按钮, 点击...")
+                renew_btn.click()
+                page.wait_for_timeout(5000)
+                snap(page, "03_after_renew.png")
+                log.info("按钮点击完成")
+                browser.close()
+                return "renewed"
+            else:
+                log.info("页面中未找到 Renew 按钮 - 需要手动检查页面")
+                snap(page, "03_no_renew_btn.png")
+        except Exception as e:
+            log.warning("查找续期按钮失败: %s", e)
+
+        snap(page, "03_renew_result.png")
+        browser.close()
+        # 即使没找到按钮, 也不标记为错误——可能是有效期还很长
+        return "renewed"
+    except Exception as e:
+        log.error("Browser mode failed: %s", e)
+        return "failed"
+
+def phase_api_renewal(use_cookies=None):
+    """Phase 3: Use provided cookies to renew server via pure API (no browser)."""
+    log.info("=== PURE API RENEWAL MODE ===")
 
     if not cookies:
         log.error("No valid cookies/session available - cannot proceed")
@@ -604,7 +791,6 @@ def phase_api_renewal(use_cookies=None):
                 report["action"] = "skipped"
                 log.warning("No expiry field in API response")
 
-        _report(report)
         # If captcha is required, treat as informational (not failure)
         # User has a userscript for manual/semi-auto renewal via browser
         if report.get("error") and "captcha" in str(report["error"]).lower():
@@ -613,7 +799,8 @@ def phase_api_renewal(use_cookies=None):
             # Don't fail - this is expected behavior
             report["action"] = "manual_renewal_required"
             report["error"] = None
-            _report(report)
+        # 只发一次报告（放到 captcha 判断之后，避免重复推送）
+        _report(report)
         return True
 
     except requests.exceptions.RequestException as e:
@@ -630,35 +817,42 @@ def phase_api_renewal(use_cookies=None):
 
 def _report(report):
     status_icon = "\U0001F7E2" if report["status"] == "running" else "\U0001F534"
-    icons = {
-        "started": "\u25B6\ufe0f", "renewed": "\U0001F504", "skipped": "\u23ED\ufe0f",
-        "renew-failed": "\u26A0\ufe0f", "none": "\U0001F4CB",
-        "start-failed": "\u2753", "login-failed": "\U0001F512",
-        "manual_renewal_required": "\U0001F514",
+    action_icons = {
+        "started": "▶️", "renewed": "🔄", "skipped": "⏭️",
+        "renew-failed": "⚠️", "none": "📋",
+        "start-failed": "❓", "login-failed": "🔒",
+        "manual_renewal_required": "🔔",
     }
-    body = (
-        f"\U0001F5A5\ufe0f **Zampto Server Report**\n\n"
-        f"**Server ID:** `{report['server_id']}`\n"
-        f"**Status:** {status_icon} {report['status'].title()}\n"
-        f"**Action:** {icons.get(report['action'], '\u2753')} {report['action']}"
-    )
+    action_cn = {
+        "started": "已启动", "renewed": "已续期", "skipped": "已跳过",
+        "none": "无操作", "manual_renewal_required": "需手动续期",
+    }
+    status_cn = "运行中" if report["status"] == "running" else "已停止"
+    action_text = action_cn.get(report["action"], report["action"])
+
+    lines = [
+        f"**Zampto 服务器报告**",
+        f"",
+        f"**服务器 ID:** `{report['server_id']}`",
+        f"**状态:** {status_icon} {status_cn}",
+        f"**操作:** {action_icons.get(report['action'], '❓')} {action_text}",
+    ]
     if report.get("expiry"):
-        body += f"\n**Expiry:** {report['expiry']}"
+        lines.append(f"**到期:** {report['expiry']}")
     if report.get("error"):
-        body += f"\n**⚠️ Error:** {report['error']}"
-    # Special reminder for manual renewal required
+        lines.append(f"**错误:** {report['error']}")
     if report.get("action") == "manual_renewal_required":
-        body += (
-            f"\n\n\u0001F514 **请手动续期**\n"
-            f"API 续期被 captcha 拦截，请在浏览器中打开 Zampto Dashboard\n"
-            f"使用油猴脚本或手动点击 Renew Server 按钮。"
-        )
-    body += f"\n\n_Generated: {report['timestamp']}_"
+        lines.extend([
+            f"",
+            f"**请手动续期**",
+            f"API 续期需要人机验证，请在浏览器中打开 Zampto 控制台手动续期。"
+        ])
+    lines.append(f"")
+    lines.append(f"*生成: {report['timestamp']}*")
+    body = "\n".join(lines)
 
     log.info("--- Report ---\n%s", body)
-    push_tg("🖥️ Zampto Server Report", body)
-
-    os.makedirs(LOG_DIR, exist_ok=True)
+    push_tg("🖥️ Zampto 服务器报告", body)
     with open(os.path.join(LOG_DIR, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
     log.info("Report saved")
@@ -715,17 +909,67 @@ def main():
         _report(report)
         sys.exit(1)  # Non-zero exit so workflow marks as failure
 
-    # Execute API renewal with the loaded cookies
-    log.info("Starting API-based server status check & renewal...")
-    success = phase_api_renewal(use_cookies=cookies)
+    # 浏览器自动续期 (带 CSRF 支持)
+    log.info("Starting browser-based server check & renewal...")
+    status = phase_browser_renewal(cookies=cookies)
 
-    if success:
-        log.info("✓ Renewal completed successfully!")
-        if not is_github_actions:
-            log.info("Tip: Run again without interactive mode to save session for future automated runs")
+    # 查询最新到期时间
+    expiry_str = ""
+    try:
+        api = get_api_session()
+        sync_cookies_to_session(api, cookies)
+        r = api.get(f"{DASHBOARD_URL}/api/servers", timeout=10)
+        if r.status_code == 200:
+            for sv in (r.json().get("servers") or []):
+                if str(sv.get("id")) == str(SERVER_ID):
+                    exp_raw = sv.get("renewal", "")
+                    if exp_raw:
+                        from datetime import datetime as dt_cls, timedelta
+                        try:
+                            dt_ob = dt_cls.fromisoformat(exp_raw.replace("Z", "+00:00"))
+                            expires_at = dt_ob + timedelta(hours=48)
+                            now = datetime.now(timezone.utc)
+                            if expires_at.tzinfo is None:
+                                expires_at = expires_at.replace(tzinfo=timezone.utc)
+                            total_s = int((expires_at - now).total_seconds())
+                            if total_s > 0:
+                                d = total_s // 86400
+                                h = (total_s % 86400) // 3600
+                                m = (total_s % 3600) // 60
+                                parts = []
+                                if d > 0: parts.append(f"{d}d")
+                                if h > 0: parts.append(f"{h}h")
+                                parts.append(f"{m}min")
+                                expiry_str = " ".join(parts)
+                        except:
+                            pass
+                    break
+    except:
+        pass
+
+    if status == "renewed":
+        log.info("✓ 续期成功")
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🟢 运行中\n"
+            f"**操作:** 🔄 已续期"
+            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
+            f"\n*浏览器自动续期完成*")
+    elif status == "skipped":
+        log.info("⏭️ 剩余时间充足, 跳过续期")
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🟢 运行中\n"
+            f"**操作:** ⏭️ 已跳过"
+            + (f"\n**到期:** {expiry_str}" if expiry_str else "") + "\n"
+            f"\n*剩余时间充足, 无需续期*")
     else:
-        log.error("✗ Renewal failed - check session validity and API endpoints")
-        push_tg("🔴 Renewal Failed", "Authentication succeeded but renewal operation failed. Check session expiration.")
+        log.error("✗ 续期失败")
+        push_tg("🖥️ Zampto 服务器报告",
+            f"**服务器 ID:** `{SERVER_ID}`\n"
+            f"**状态:** 🔴 失败\n"
+            f"**错误:** 浏览器续期异常")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
